@@ -43,6 +43,7 @@ struct Config {
 /**===============全局变量===============*/
 Config config;
 WebServer server(80);
+HTTPClient http;
 String lastDisplayedText = "";                // 上次显示文本
 unsigned long lastActiveTime = 0;             // 上次活跃时间
 unsigned long lastScreenUpdateTime = 0;       // 上次屏幕更新时间
@@ -56,8 +57,6 @@ bool turnOnScreen = true;                     // 是否要开启屏幕
 bool delayToTurnOffScreen;                    // 延迟关闭屏幕
 bool onCountdown = false;                     // 是否处于倒计时中
 bool screenStateBeforeCountdown = true;       // 进入倒计时模式时前的屏幕开关状态
-
-
 
 /**===============函数===============*/
 
@@ -92,7 +91,6 @@ void displayText(String text) {
     lastDisplayedText = text;
   }
 }
-
 
 // 绘制当前设备信息
 void drawInfoScreen() {
@@ -139,7 +137,6 @@ void setupWiFi() {
 // 发送 HTTP 请求
 void sendRequest(int action) {
   if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
   String url;
   switch (action) {
     case 0: url = "http://" + String(config.koReaderIP) + ":" + String(config.koReaderPort) + "/koreader/event/GotoViewRel/-1"; break;    // 上一页
@@ -149,8 +146,7 @@ void sendRequest(int action) {
     default: return;
   }
   http.begin(url);
-  int httpCode = http.GET();
-  // if (httpCode > 0 && config.beepOnPress) StickCP2.Speaker.tone(BEEP_PRESSED_FREQ, BEEP_PRESSED_DURATION);
+  http.GET();
   http.end();
 }
 
@@ -395,6 +391,10 @@ void setup() {
   loadConfig();
   initDisplay();
   setupWiFi();
+  // 设置连接超时，避免请求不通时长时间阻塞
+  http.setConnectTimeout(500);
+  // 设置读取响应内容超时（不关心这个，故设置为 1 ms）
+  http.setTimeout(1);
   lastActiveTime = millis();
 }
 
