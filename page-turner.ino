@@ -49,7 +49,9 @@ unsigned long lastScreenUpdateTime = 0;       // 上次屏幕更新时间
 unsigned long pwrBtnpressStartTime = 0;       // 电源键按下的时间
 uint16_t textColor = GREEN;                   // 动态字体颜色
 const unsigned long longPressDuration = 500;  // 电源键长按的时间阈值，单位为毫秒
+const int batteryThreshold = 5;               // 电量变动阈值
 int lastRemainingSeconds = -1;                // 倒计时剩余秒数
+int lastBatteryLevel = -1;                    // 上一次的电量
 bool turnOnScreen = true;                     // 是否要开启屏幕
 bool delayToTurnOffScreen;                    // 延迟关闭屏幕
 bool onCountdown = false;                     // 是否处于倒计时中
@@ -91,7 +93,8 @@ void displayText(String text) {
   }
 }
 
-// 绘制当前网络信息
+
+// 绘制当前设备信息
 void drawInfoScreen() {
   String info;
   if (WiFi.status() == WL_CONNECTED) {
@@ -102,7 +105,13 @@ void drawInfoScreen() {
     textColor = RED;
   }
 
-  info = info + "\n电量: " + StickCP2.Power.getBatteryLevel() + "%";
+  // 获取当前电池电量
+  int currentBatteryLevel = StickCP2.Power.getBatteryLevel();
+  // 只有当电量变化超过阈值或者第一次获取时才更新显示
+  if (lastBatteryLevel < 0 || abs(currentBatteryLevel - lastBatteryLevel) >= batteryThreshold) {
+    lastBatteryLevel = currentBatteryLevel;
+  }
+  info += "\n电量: " + String(lastBatteryLevel) + "%";
   displayText(info);
 }
 
