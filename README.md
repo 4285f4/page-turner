@@ -1,1 +1,1 @@
-A KOReader page turner made with Arduino and M5StickC Plus2.
+A page turner for KOReader made with M5StickC Plus 2 and Arduino.

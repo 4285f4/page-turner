@@ -1,358 +1,379 @@
-#include "M5StickCPlus2.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
+/**
+ * @file page-turner.ino
+ * @author onehero (onehero0927@163.com)
+ * @brief A page turner for KOReader made with M5StickC Plus 2 and Arduino.
+ * @version 1.0
+ * @date 2025-02-23
+ */
+
+#include <M5StickCPlus2.h>
 #include <EEPROM.h>
+#include <WiFi.h>
 #include <WebServer.h>
-#include <ESPmDNS.h>
+#include <HTTPClient.h>
 
-//================ 默认配置 ================//
-#define DEFAULT_SSID "M5StickC-Plus2"
-#define DEFAULT_PASS "12345678"
-#define DEFAULT_IP "192.168.2.99"
-#define DEFAULT_PORT 8080
-//=========================================//
+/**===============宏定义===============*/
+#define EEPROM_SIZE sizeof(Config)
+#define BEEP_SHUTDOWN_FREQ 4000
+#define BEEP_SHUTDOWN_DURATION 100
+#define BEEP_PRESSED_FREQ 8000
+#define BEEP_PRESSED_DURATION 20
+#define DEVICE_SSID "M5StickC-Plus2"
+#define DEVICE_PASSWORD "12345678"
 
-//================ 用户配置 ================//
-const bool ENABLE_BUTTON_BEEP = true;                            // 启用按键提示音
-const bool ENABLE_COUNTDOWN_BEEP = false;                        // 启用倒计时蜂鸣
-const bool ENABLE_SCREEN_PROMPT = true;                          // 启用屏幕倒计时提示
-const unsigned long SHUTDOWN_TIMEOUT = 600000;                   // 10分钟无操作关机
-const unsigned long COUNTDOWN_START = SHUTDOWN_TIMEOUT - 10000;  // 关机前10秒提示
-const int BEEP_FREQ = 4000;                                      // 警告蜂鸣频率
-const int BEEP_DURATION = 100;                                   // 警告蜂鸣时长(ms)
-const int BUTTON_FREQ = 8000;                                    // 按键提示音频率
-const int BUTTON_DURATION = 20;                                  // 按键提示音时长(ms)
-const int SCREEN_TIMEOUT = 3000;                                 // 启动提示显示时长(ms)
-//=========================================//
-
-// 硬件定义
-#define BUTTON_C_PIN 35
-#define EEPROM_SIZE 128
-#define CONFIG_MAGIC 0xAA55
-
-// EEPROM存储结构
+/**===============配置结构体===============*/
 struct Config {
-  uint16_t magic;
-  char ssid[32];
-  char password[64];
-  char targetIP[16];
-  uint16_t targetPort;
+  char ssid[32] = "defaultSSID";          // 默认 WiFi 名称
+  char password[32] = "defaultPass";      // 默认 WiFi 密码
+  char koReaderIP[16] = "192.168.1.100";  // 默认 KOReader IP
+  int koReaderPort = 8080;                // 默认 KOReader 端口
+  int aBtnClickAction = 1;                // 按键 A 单击（1:下一页）
+  int aBtnHoldAction = 2;                 // 按键 A 长按（2:完全刷新）
+  int bBtnClickAction = 0;                // 按键 B 单击（0:上一页）
+  int bBtnHoldAction = 3;                 // 按键 B 长按（3:切换灯光）
+  bool keepScreenOn = true;               // 是否保持屏幕开启
+  bool beepOnPress = true;                // 按键蜂鸣开关
+  int autoShutdownTime = 600;             // 自动关机时间（秒），默认 10 分钟
+  bool shutdownCountdownScreen = true;    // 倒计时屏幕提示开关，默认开
+  bool shutdownCountdownBeep = false;     // 倒计时蜂鸣提示开关，默认关
+  int countdownTime = 10;                 // 倒计时提示时间（秒），默认 10 秒
 };
 
-// 全局变量
+/**===============全局变量===============*/
+Config config;
 WebServer server(80);
-Config deviceConfig;
-bool screenEnabled = false;  // 是否启用屏幕显示提示信息，可通过电源键切换显示
-bool isAPMode = false;
-unsigned long lastActivityTime = 0;
-unsigned long lastBeepTime = 0;
-unsigned long lastScreenUpdate = 0;
-int lastRemainingSeconds = -1;
-String lastSSID;
-String lastIP;
-String lastTarget;
+String lastDisplayedText = "";           // 上次显示文本
+unsigned long lastActiveTime = 0;        // 上次活跃时间
+unsigned long lastScreenUpdateTime = 0;  // 上次屏幕更新时间
+uint16_t textColor = GREEN;              // 动态字体颜色
+int lastRemainingSeconds = -1;           // 倒计时剩余秒数
+bool turnOnScreen = true;                // 是否要开启屏幕
+bool delayToTurnOffScreen;               // 延迟关闭屏幕
+bool onCountdown = false;                // 是否处于倒计时中
+bool screenStateBeforeCountdown = true;  // 进入倒计时模式时前的屏幕开关状态
 
-// 自定义ButtonC检测
-bool isButtonCPressed() {
-  static unsigned long lastPress = 0;
-  if (digitalRead(BUTTON_C_PIN) == LOW) {
-    if (millis() - lastPress > 500) {
-      lastPress = millis();
-      return true;
-    }
-  }
-  return false;
-}
+/**===============函数===============*/
 
-void initDisplay() {
-  StickCP2.Display.setBrightness(15);
-  StickCP2.Display.setRotation(1);
-  StickCP2.Display.setTextColor(GREEN);
-  StickCP2.Display.setTextDatum(top_left);
-  StickCP2.Display.setTextFont(&fonts::efontCN_16);
-  StickCP2.Display.setTextSize(1);
-}
-
-void drawStatusScreen(bool forceUpdate = false) {
-  // 获取当前状态
-  String currentSSID = WiFi.status() == WL_CONNECTED ? String(deviceConfig.ssid) : "";
-  String currentIP = WiFi.localIP().toString();
-  String currentTarget = String(deviceConfig.targetIP) + ":" + String(deviceConfig.targetPort);
-
-  // 检查是否需要更新
-  if (!forceUpdate && currentSSID == lastSSID && currentIP == lastIP && currentTarget == lastTarget) {
-    return;
-  }
-
-  // 更新状态缓存
-  lastSSID = currentSSID;
-  lastIP = currentIP;
-  lastTarget = currentTarget;
-
-  // 开始绘制
-  StickCP2.Display.clear();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    StickCP2.Display.setTextColor(GREEN);
-    StickCP2.Display.drawString("已连接 WIFI: " + String(deviceConfig.ssid), 0, 10);
-    StickCP2.Display.drawString("设备 IP: " + WiFi.localIP().toString(), 0, 30);
-    StickCP2.Display.drawString("koreader: " + String(deviceConfig.targetIP) + ":" + String(deviceConfig.targetPort), 0, 50);
-  } else {
-    StickCP2.Display.setTextColor(RED);
-    StickCP2.Display.drawString("连接指定 WIFI 失败", 0, 10);
-    StickCP2.Display.drawString("请连接以下热点重新配网", 0, 30);
-    StickCP2.Display.setTextColor(GREEN);
-    StickCP2.Display.drawString("名称: " DEFAULT_SSID, 0, 50);
-    StickCP2.Display.drawString("密码: " DEFAULT_PASS, 0, 70);
-  }
-}
-
-void toggleScreen() {
-  screenEnabled = !screenEnabled;
-  if (screenEnabled) {
-    StickCP2.Display.wakeup();
-    drawStatusScreen(true);
-  } else {
-    StickCP2.Display.clear();
-    StickCP2.Display.sleep();
-  }
-}
-
-void saveConfig() {
-  deviceConfig.magic = CONFIG_MAGIC;
-  EEPROM.put(0, deviceConfig);
-  EEPROM.commit();
-}
-
+// 加载配置
 void loadConfig() {
-  EEPROM.get(0, deviceConfig);
-  if (deviceConfig.magic != CONFIG_MAGIC) {
-    // 初始化默认配置
-    memset(&deviceConfig, 0, sizeof(deviceConfig));
-    strncpy(deviceConfig.ssid, DEFAULT_SSID, sizeof(deviceConfig.ssid));
-    strncpy(deviceConfig.password, DEFAULT_PASS, sizeof(deviceConfig.password));
-    strncpy(deviceConfig.targetIP, DEFAULT_IP, sizeof(deviceConfig.targetIP));
-    deviceConfig.targetPort = DEFAULT_PORT;
-    saveConfig();
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(0, config);
+  EEPROM.end();
+  // 检查是否首次运行
+  if (strcmp(config.ssid, "defaultSSID") == 0) {
+    saveConfig();  // 首次运行时保存默认配置
+  }
+  delayToTurnOffScreen = !config.keepScreenOn;
+}
+
+// 保存配置
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(0, config);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+// 屏幕显示优化（避免闪烁）
+void displayText(String text) {
+  if (text != lastDisplayedText) {
+    StickCP2.Display.fillScreen(BLACK);
+    StickCP2.Display.setCursor(0, 0);
+    StickCP2.Display.setTextSize(1);
+    StickCP2.Display.setTextColor(textColor);
+    StickCP2.Display.println(text);
+    lastDisplayedText = text;
   }
 }
 
-void startAPMode() {
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
-  isAPMode = true;
+// 绘制当前网络信息
+void drawInfoScreen() {
+  String info;
+  if (WiFi.status() == WL_CONNECTED) {
+    info = "已连接 WiFi: " + String(WiFi.SSID()) + "\n设备 IP: " + WiFi.localIP().toString() + "\nKOReader: " + config.koReaderIP + ":" + config.koReaderPort;
+    textColor = GREEN;
+  } else {
+    info = "热点名称: " + String(DEVICE_SSID) + "\n热点密码: " + String(DEVICE_PASSWORD) + "\nIP: " + WiFi.softAPIP().toString();
+    textColor = RED;
+  }
 
-  // 显示AP信息
-  Serial.println("AP Mode Activated");
-  Serial.print("SSID: ");
-  Serial.println(DEFAULT_SSID);
-  Serial.print("Password: ");
-  Serial.println(DEFAULT_PASS);
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
-
-  // 配置AP模式下的Web服务器
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html",
-                "<form action='/config' method='POST'>"
-                "WiFi 名称: <input type='text' name='ssid' value='"
-                  + String(deviceConfig.ssid) + "'><br>"
-                                                "WiFi 密码: <input type='password' name='pass' value='"
-                  + String(deviceConfig.password) + "'><br>"
-                                                    "koreader IP: <input type='text' name='ip' value='"
-                  + String(deviceConfig.targetIP) + "'><br>"
-                                                    "koreader 端口: <input type='number' name='port' value='"
-                  + String(deviceConfig.targetPort) + "'><br>"
-                                                      "<input type='submit' value='保存'>"
-                                                      "</form>");
-  });
-
-  server.on("/config", HTTP_POST, []() {
-    strncpy(deviceConfig.ssid, server.arg("ssid").c_str(), sizeof(deviceConfig.ssid));
-    strncpy(deviceConfig.password, server.arg("pass").c_str(), sizeof(deviceConfig.password));
-    strncpy(deviceConfig.targetIP, server.arg("ip").c_str(), sizeof(deviceConfig.targetIP));
-    deviceConfig.targetPort = server.arg("port").toInt();
-    saveConfig();
-    server.send(200, "text/plain", "配置已保存，正在重启...");
-    delay(1000);
-    ESP.restart();
-  });
-
-  server.begin();  // 确保服务器启动
+  info = info + "\n电量: " + StickCP2.Power.getBatteryLevel() + "%";
+  displayText(info);
 }
 
-void connectWiFi() {
-  WiFi.begin(deviceConfig.ssid, deviceConfig.password);
+// WiFi 设置
+void setupWiFi() {
+  textColor = RED;
+  displayText("正在连接 WiFi...");
+  WiFi.begin(config.ssid, config.password);
+  // 在 10s 内，每隔 500ms 检查一次 WIFI 连接状态
   unsigned long start = millis();
-
-  // 显示连接状态
-  StickCP2.Display.clear();
-  StickCP2.Display.setTextDatum(middle_center);
-  StickCP2.Display.drawString("正在连接 WiFi...", StickCP2.Display.width() / 2, StickCP2.Display.height() / 2);
-  StickCP2.Display.setTextDatum(top_left);
-
   while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
     delay(500);
   }
 
+  // WiFi 连接失败时开启热点
   if (WiFi.status() != WL_CONNECTED) {
-    startAPMode();  // 连接失败时启动AP模式
-    // 更新屏幕显示
-    StickCP2.Display.clear();
-    StickCP2.Display.setTextColor(RED);
-    StickCP2.Display.drawString("连接指定 WIFI 失败", 0, 10);
-    StickCP2.Display.drawString("请连接以下热点重新配网", 0, 30);
-    StickCP2.Display.setTextColor(GREEN);
-    StickCP2.Display.drawString("名称: " DEFAULT_SSID, 0, 50);
-    StickCP2.Display.drawString("密码: " DEFAULT_PASS, 0, 70);
-    return;
+    WiFi.softAP(DEVICE_SSID, DEVICE_PASSWORD);
   }
 
-  // 连接成功后的处理
-  if (!MDNS.begin("m5stickc-plus2")) {
-    Serial.println("Error setting up MDNS responder!");
-  }
-
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html",
-                "<h1>设备控制面板</h1>"
-                "<p><a href='/config'>配置WiFi</a></p>");
-  });
-
-  server.on("/config", HTTP_GET, []() {
-    server.send(200, "text/html",
-                "<form action='/update' method='POST'>"
-                "新 WIFI 名称: <input type='text' name='ssid' value='"
-                  + String(deviceConfig.ssid) + "'><br>"
-                                                "新 WIFI 密码: <input type='password' name='pass' value='"
-                  + String(deviceConfig.password) + "'><br>"
-                                                    "目标IP: <input type='text' name='ip' value='"
-                  + String(deviceConfig.targetIP) + "'><br>"
-                                                    "目标端口: <input type='number' name='port' value='"
-                  + String(deviceConfig.targetPort) + "'><br>"
-                                                      "<input type='submit' value='更新'>"
-                                                      "</form>");
-  });
-
-  server.on("/update", HTTP_POST, []() {
-    strncpy(deviceConfig.ssid, server.arg("ssid").c_str(), sizeof(deviceConfig.ssid));
-    strncpy(deviceConfig.password, server.arg("pass").c_str(), sizeof(deviceConfig.password));
-    strncpy(deviceConfig.targetIP, server.arg("ip").c_str(), sizeof(deviceConfig.targetIP));
-    deviceConfig.targetPort = server.arg("port").toInt();
-    saveConfig();
-    server.send(200, "text/plain", "配置已更新，重启中...");
-    delay(1000);
-    ESP.restart();
-  });
-
+  server.on("/", handleRoot);
+  server.on("/save", handleSave);
   server.begin();
 }
 
-
-void handleShutdownCountdown(unsigned long currentTime, unsigned long inactiveTime) {
-  if (ENABLE_SCREEN_PROMPT) {
-    StickCP2.Display.wakeup();
-    int remainingSeconds = 10 - ((inactiveTime - COUNTDOWN_START) / 1000);
-
-    if (remainingSeconds != lastRemainingSeconds) {
-      StickCP2.Display.clear();
-        StickCP2.Display.setTextDatum(middle_center);
-      StickCP2.Display.drawString(String(remainingSeconds) + " 秒后关机",
-                                  StickCP2.Display.width() / 2,
-                                  StickCP2.Display.height() / 2);
-      lastRemainingSeconds = remainingSeconds;
-      StickCP2.Display.setTextDatum(top_left);
-    }
-  }
-
-  if (ENABLE_COUNTDOWN_BEEP && (currentTime - lastBeepTime >= 1000)) {
-    StickCP2.Speaker.tone(BEEP_FREQ, BEEP_DURATION);
-    lastBeepTime = currentTime;
-  }
-}
-
-void sendTurnPageRequest(int turnPageSize) {
+// 发送 HTTP 请求
+void sendRequest(int action) {
+  if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String url = "http://" + String(deviceConfig.targetIP) + ":" + String(deviceConfig.targetPort) + "/koreader/event/GotoViewRel/" + String(turnPageSize);
-  Serial.printf("send GET request to: %s\n", url);
+  String url;
+  switch (action) {
+    case 0: url = "http://" + String(config.koReaderIP) + ":" + String(config.koReaderPort) + "/koreader/event/GotoViewRel/-1"; break;    // 上一页
+    case 1: url = "http://" + String(config.koReaderIP) + ":" + String(config.koReaderPort) + "/koreader/event/GotoViewRel/1"; break;     // 下一页
+    case 2: url = "http://" + String(config.koReaderIP) + ":" + String(config.koReaderPort) + "/koreader/event/FullRefresh"; break;       // 完全刷新
+    case 3: url = "http://" + String(config.koReaderIP) + ":" + String(config.koReaderPort) + "/koreader/event/ToggleFrontlight"; break;  // 切换灯光
+    default: return;
+  }
   http.begin(url);
   int httpCode = http.GET();
-  if (httpCode > 0) {
-    Serial.printf("GET request sent to %s\n", url.c_str());
-  } else {
-    Serial.printf("Error sending GET request: %s\n", http.errorToString(httpCode).c_str());
-  }
+  // if (httpCode > 0 && config.beepOnPress) StickCP2.Speaker.tone(BEEP_PRESSED_FREQ, BEEP_PRESSED_DURATION);
   http.end();
 }
 
+// WebServer 主页
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M5StickC-Plus2 配置</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; }
+        form { display: inline-block; text-align: left; }
+        label { display: block; margin: 5px 0; }
+        input[type="submit"] { width: 30%; padding: 10px; display: block; margin: 10px auto; }
+    </style>
+</head>
+<body>
+    <h1>设备配置</h1>
+    <form action="/save" method="post">
+        <label>WiFi 名称: <input type="text" name="ssid" value=")"
+                + String(config.ssid) + R"(" maxlength="31"></label>
+        <label>WiFi 密码: <input type="text" name="password" value=")"
+                + String(config.password) + R"(" maxlength="31"></label>
+        <label>KOReader IP: <input type="text" name="koReaderIP" value=")"
+                + String(config.koReaderIP) + R"(" maxlength="15"></label>
+        <label>KOReader 端口: <input type="number" name="koReaderPort" value=")"
+                + String(config.koReaderPort) + R"(" min="1" max="65535"></label>
+        <label>按键 A 单击: <select name="aClick">
+            <option value="0" )"
+                + (config.aBtnClickAction == 0 ? "selected" : "") + R"(>上一页</option>
+            <option value="1" )"
+                + (config.aBtnClickAction == 1 ? "selected" : "") + R"(>下一页</option>
+            <option value="2" )"
+                + (config.aBtnClickAction == 2 ? "selected" : "") + R"(>完全刷新</option>
+            <option value="3" )"
+                + (config.aBtnClickAction == 3 ? "selected" : "") + R"(>切换灯光</option>
+        </select></label>
+        <label>按键 A 长按: <select name="aLong">
+            <option value="0" )"
+                + (config.aBtnHoldAction == 0 ? "selected" : "") + R"(>上一页</option>
+            <option value="1" )"
+                + (config.aBtnHoldAction == 1 ? "selected" : "") + R"(>下一页</option>
+            <option value="2" )"
+                + (config.aBtnHoldAction == 2 ? "selected" : "") + R"(>完全刷新</option>
+            <option value="3" )"
+                + (config.aBtnHoldAction == 3 ? "selected" : "") + R"(>切换灯光</option>
+        </select></label>
+        <label>按键 B 单击: <select name="bClick">
+            <option value="0" )"
+                + (config.bBtnClickAction == 0 ? "selected" : "") + R"(>上一页</option>
+            <option value="1" )"
+                + (config.bBtnClickAction == 1 ? "selected" : "") + R"(>下一页</option>
+            <option value="2" )"
+                + (config.bBtnClickAction == 2 ? "selected" : "") + R"(>完全刷新</option>
+            <option value="3" )"
+                + (config.bBtnClickAction == 3 ? "selected" : "") + R"(>切换灯光</option>
+        </select></label>
+        <label>按键 B 长按: <select name="bLong">
+            <option value="0" )"
+                + (config.bBtnHoldAction == 0 ? "selected" : "") + R"(>上一页</option>
+            <option value="1" )"
+                + (config.bBtnHoldAction == 1 ? "selected" : "") + R"(>下一页</option>
+            <option value="2" )"
+                + (config.bBtnHoldAction == 2 ? "selected" : "") + R"(>完全刷新</option>
+            <option value="3" )"
+                + (config.bBtnHoldAction == 3 ? "selected" : "") + R"(>切换灯光</option>
+        </select></label>
+        <label>保持屏幕开启: <input type="checkbox" name="keepScreenOn" )"
+                + (config.keepScreenOn ? "checked" : "") + R"(></label>
+        <label>按键蜂鸣: <input type="checkbox" name="beepOnPress" )"
+                + (config.beepOnPress ? "checked" : "") + R"(></label>
+        <label>自动关机时间(秒): <input type="number" name="autoShutdownTime" value=")"
+                + String(config.autoShutdownTime) + R"(" min="0"></label>
+        <label>倒计时屏幕提示: <input type="checkbox" name="shutdownCountdownScreen" )"
+                + (config.shutdownCountdownScreen ? "checked" : "") + R"(></label>
+        <label>倒计时蜂鸣提示: <input type="checkbox" name="shutdownCountdownBeep" )"
+                + (config.shutdownCountdownBeep ? "checked" : "") + R"(></label>
+        <label>倒计时提示时间(秒): <input type="number" name="countdownTime" value=")"
+                + String(config.countdownTime) + R"(" min="1"></label>
+        <input type="submit" value="保存">
+    </form>
+</body>
+</html>
+    )";
+  server.send(200, "text/html; charset=UTF-8", html);
+}
+
+// 保存配置
+void handleSave() {
+  strncpy(config.ssid, server.arg("ssid").c_str(), sizeof(config.ssid));
+  strncpy(config.password, server.arg("password").c_str(), sizeof(config.password));
+  strncpy(config.koReaderIP, server.arg("koReaderIP").c_str(), sizeof(config.koReaderIP));
+  config.koReaderPort = server.arg("koReaderPort").toInt();
+  config.aBtnClickAction = server.arg("aClick").toInt();
+  config.aBtnHoldAction = server.arg("aLong").toInt();
+  config.bBtnClickAction = server.arg("bClick").toInt();
+  config.bBtnHoldAction = server.arg("bLong").toInt();
+  config.keepScreenOn = server.hasArg("keepScreenOn");
+  config.beepOnPress = server.hasArg("beepOnPress");
+  config.autoShutdownTime = server.arg("autoShutdownTime").toInt();
+  config.shutdownCountdownScreen = server.hasArg("shutdownCountdownScreen");
+  config.shutdownCountdownBeep = server.hasArg("shutdownCountdownBeep");
+  config.countdownTime = server.arg("countdownTime").toInt();
+  saveConfig();
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body style=\"text-align: center;\"><h1>配置已保存，正在重启...</h1><a href=\"/\">返回</a></body></html>";
+  server.send(200, "text/html; charset=UTF-8", html);
+  delay(1000);
+  ESP.restart();
+}
+
+// A、B 按钮事件处理方法
+void handleNormalBtnEvent(m5::Button_Class& btn, int clickAction, int holdAction) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (btn.wasClicked() || btn.wasHold()) {
+    if (config.beepOnPress) {
+      StickCP2.Speaker.stop();
+      StickCP2.Speaker.tone(BEEP_PRESSED_FREQ, BEEP_PRESSED_DURATION);
+    }
+    lastActiveTime = millis();
+    lastRemainingSeconds = -1;
+    if (btn.wasClicked()) {
+      sendRequest(clickAction);
+    } else if (btn.wasHold()) {
+      sendRequest(holdAction);
+    }
+  }
+}
+
+// 电源按钮事件处理方法
+void handlePWRBtnEvent() {
+  if (M5.BtnPWR.wasClicked()) {
+    lastActiveTime = millis();
+    lastRemainingSeconds = -1;
+    if (config.beepOnPress) {
+      StickCP2.Speaker.stop();
+      StickCP2.Speaker.tone(BEEP_PRESSED_FREQ, BEEP_PRESSED_DURATION);
+    }
+    turnOnScreen = !turnOnScreen;
+    // 禁用延时关闭屏幕功能
+    delayToTurnOffScreen = false;
+  }
+}
+
+// 处理倒计时事件
+void handleShutdownCountdown(unsigned long currentTime, unsigned long inactiveTime) {
+  if (config.shutdownCountdownScreen) {
+    if (!onCountdown) {
+      screenStateBeforeCountdown = turnOnScreen;  // 保存当前屏幕状态
+    }
+    turnOnScreen = true;
+    onCountdown = true;
+    int remainingSeconds = config.autoShutdownTime - inactiveTime / 1000;
+    if (remainingSeconds != lastRemainingSeconds) {
+      if (config.shutdownCountdownBeep) {
+        StickCP2.Speaker.tone(BEEP_SHUTDOWN_FREQ, BEEP_SHUTDOWN_DURATION);
+      }
+      textColor = RED;
+      displayText("关机倒计时: " + String(remainingSeconds) + " 秒");
+      lastRemainingSeconds = remainingSeconds;
+    }
+  }
+}
+
+// 长时间无操作自动关机处理方法
+void handleAutoShutdown() {
+  // 长时间无操作自动关机逻辑
+  unsigned long currentTime = millis();
+  unsigned long inactiveTime = currentTime - lastActiveTime;
+  if (inactiveTime >= config.autoShutdownTime * 1000) {
+    StickCP2.Power.powerOff();
+  } else if (inactiveTime >= (config.autoShutdownTime - config.countdownTime) * 1000) {
+    // 倒计时处理
+    handleShutdownCountdown(currentTime, inactiveTime);
+  } else {
+    if (onCountdown) {
+      turnOnScreen = screenStateBeforeCountdown;  // 恢复屏幕状态
+      onCountdown = false;
+    }
+  }
+}
+
+// 屏幕开关处理
+void handleScreenSwitch() {
+  // 保持屏幕常亮开关=开，WIFI 未连接，屏幕常开，电源键可切换屏幕开关
+  // 保持屏幕常亮开关=开，WIFI 已连接，屏幕常开，电源键可切换屏幕开关
+  // 保持屏幕常亮开关=关，WIFI 已连接，屏幕等待五秒后关闭，电源键可切换屏幕开关
+  // 保持屏幕常亮开关=关，WIFI 未连接，屏幕等待五秒后关闭，电源键可切换屏幕开关
+  if (delayToTurnOffScreen && !config.keepScreenOn && millis() - lastActiveTime > 5000) {
+    turnOnScreen = false;
+    delayToTurnOffScreen = false;
+  }
+
+  if (turnOnScreen) {
+    StickCP2.Display.wakeup();
+    if (!onCountdown) drawInfoScreen();
+  } else {
+    StickCP2.Display.sleep();
+  }
+}
+
+// 初始化屏幕
+void initDisplay() {
+  StickCP2.Display.setRotation(1);  // 调整屏幕方向
+  StickCP2.Display.setBrightness(15);
+  StickCP2.Display.setTextColor(textColor);
+  StickCP2.Display.setFont(&efontCN_16);
+}
+
+// 初始化
 void setup() {
   auto cfg = M5.config();
   StickCP2.begin(cfg);
-  pinMode(BUTTON_C_PIN, INPUT_PULLUP);
-
-  EEPROM.begin(EEPROM_SIZE);
   loadConfig();
-
   initDisplay();
-  delay(1000);
-
-  connectWiFi();
-  drawStatusScreen(true);
-  delay(SCREEN_TIMEOUT);
-  if (!screenEnabled) {
-    StickCP2.Display.clear();
-    StickCP2.Display.sleep();
-  }
-  lastActivityTime = millis();
+  setupWiFi();
+  lastActiveTime = millis();
 }
 
+// 主循环
 void loop() {
   StickCP2.update();
-  unsigned long currentTime = millis();
-  unsigned long inactiveTime = currentTime - lastActivityTime;
 
-  // 关机检测
-  if (inactiveTime >= SHUTDOWN_TIMEOUT) {
-    StickCP2.Power.powerOff();
-  }
-  // 倒计时处理
-  else if (inactiveTime >= COUNTDOWN_START) {
-    handleShutdownCountdown(currentTime, inactiveTime);
-  }
+  // 屏幕开关处理
+  handleScreenSwitch();
 
   // 按键处理
-  if (StickCP2.BtnA.wasPressed() || StickCP2.BtnB.wasPressed()) {
-    lastActivityTime = currentTime;
-    lastRemainingSeconds = -1;
+  handleNormalBtnEvent(StickCP2.BtnA, config.aBtnClickAction, config.aBtnHoldAction);
+  handleNormalBtnEvent(StickCP2.BtnB, config.bBtnClickAction, config.bBtnHoldAction);
+  handlePWRBtnEvent();
 
-    if (ENABLE_BUTTON_BEEP) {
-      StickCP2.Speaker.stop();
-      StickCP2.Speaker.tone(BUTTON_FREQ, BUTTON_DURATION);
-    }
+  // 自动关机处理
+  handleAutoShutdown();
 
-    if (StickCP2.BtnA.wasPressed()) sendTurnPageRequest(1);
-    if (StickCP2.BtnB.wasPressed()) sendTurnPageRequest(-1);
-
-    if (!screenEnabled) {
-      StickCP2.Display.clear();
-      StickCP2.Display.sleep();
-    }
-  }
-
-  // 处理ButtonC
-  if (isButtonCPressed()) {
-    toggleScreen();
-    lastActivityTime = currentTime;
-  }
-
-  // 更新屏幕信息
-  if (screenEnabled && (currentTime - lastScreenUpdate >= 1000)) {
-    drawStatusScreen();
-    lastScreenUpdate = currentTime;
-  }
-
-  // 处理Web请求
   server.handleClient();
 }
