@@ -20,6 +20,7 @@
 #define BEEP_PRESSED_DURATION 20
 #define DEVICE_SSID "M5StickC-Plus2"
 #define DEVICE_PASSWORD "12345678"
+#define BTN_PWR_PIN 35
 
 /**===============配置结构体===============*/
 struct Config {
@@ -42,15 +43,19 @@ struct Config {
 /**===============全局变量===============*/
 Config config;
 WebServer server(80);
-String lastDisplayedText = "";           // 上次显示文本
-unsigned long lastActiveTime = 0;        // 上次活跃时间
-unsigned long lastScreenUpdateTime = 0;  // 上次屏幕更新时间
-uint16_t textColor = GREEN;              // 动态字体颜色
-int lastRemainingSeconds = -1;           // 倒计时剩余秒数
-bool turnOnScreen = true;                // 是否要开启屏幕
-bool delayToTurnOffScreen;               // 延迟关闭屏幕
-bool onCountdown = false;                // 是否处于倒计时中
-bool screenStateBeforeCountdown = true;  // 进入倒计时模式时前的屏幕开关状态
+String lastDisplayedText = "";                // 上次显示文本
+unsigned long lastActiveTime = 0;             // 上次活跃时间
+unsigned long lastScreenUpdateTime = 0;       // 上次屏幕更新时间
+unsigned long pwrBtnpressStartTime = 0;       // 电源键按下的时间
+uint16_t textColor = GREEN;                   // 动态字体颜色
+const unsigned long longPressDuration = 500;  // 电源键长按的时间阈值，单位为毫秒
+int lastRemainingSeconds = -1;                // 倒计时剩余秒数
+bool turnOnScreen = true;                     // 是否要开启屏幕
+bool delayToTurnOffScreen;                    // 延迟关闭屏幕
+bool onCountdown = false;                     // 是否处于倒计时中
+bool screenStateBeforeCountdown = true;       // 进入倒计时模式时前的屏幕开关状态
+
+
 
 /**===============函数===============*/
 
@@ -270,9 +275,32 @@ void handleNormalBtnEvent(m5::Button_Class& btn, int clickAction, int holdAction
   }
 }
 
+// 自定义电源键单击检测方法
+bool isPWRBtnClicked() {
+  int btnState = digitalRead(BTN_PWR_PIN);
+
+  if (btnState == LOW) {                // 按键被按下
+    if (pwrBtnpressStartTime == 0) {    // 如果是第一次按下
+      pwrBtnpressStartTime = millis();  // 记录按下时间
+    }
+  } else {                                                            // 按键被松开
+    if (pwrBtnpressStartTime != 0) {                                  // 如果之前有按下记录
+      unsigned long pressDuration = millis() - pwrBtnpressStartTime;  // 计算按下持续时间
+
+      pwrBtnpressStartTime = 0;                 // 重置按下时间
+      if (pressDuration < longPressDuration) {  // 如果按下时间小于长按阈值
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // 电源按钮事件处理方法
 void handlePWRBtnEvent() {
-  if (M5.BtnPWR.wasClicked()) {
+  // 使用自定义的电源键单击检测方法而不是 M5.BtnPWR.wasClicked()
+  // 是因为后者在断开 USB 连接时长按电源键开机会被识别成单击，导致屏幕被立刻关闭（原因未知）
+  if (isPWRBtnClicked()) {
     lastActiveTime = millis();
     lastRemainingSeconds = -1;
     if (config.beepOnPress) {
@@ -352,6 +380,7 @@ void initDisplay() {
 
 // 初始化
 void setup() {
+  pinMode(BTN_PWR_PIN, INPUT);
   auto cfg = M5.config();
   StickCP2.begin(cfg);
   loadConfig();
